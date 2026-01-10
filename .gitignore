@@ -1,4 +1,10 @@
 # 
+# Custom
+# 
+dist/
+build/
+
+# 
 # standard
 # 
 **/*.do_not_sync
@@ -351,7 +357,7 @@ db.sqlite3-journal
 .scrapy
 
 # Sphinx documentation
-/docs/_build/
+docs/_build/
 
 # PyBuilder
 #target/
@@ -606,7 +612,6 @@ settings/home/*
 !settings/home/.zshrc
 !settings/home/.zshenv
 settings/home/Library/Caches
-settings/home/.pnpm-store
 # dont remove these next one unless you want passwords to be public
 # these are redundant, but kept as a fail-safe
 settings/home/Library/Keychains
