@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.metadata as importlib_metadata
 import inspect
 import json
 import keyword
+import pkgutil
 import re
 import sys
 from dataclasses import dataclass, field
@@ -72,6 +74,40 @@ def sanitize_identifier(name: str) -> str:
     if keyword.iskeyword(s):
         s += "_"
     return s
+
+
+def _normalize_name(name: str) -> str:
+    """PEP 503-style normalization: lowercase and replace runs of -_. with -."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _submodules_requiring_import(modname: str) -> List[str]:
+    """
+    List submodules under `modname` that are not already accessible as attributes
+    after importing `modname` itself.
+    """
+    root = importlib.import_module(modname)
+    if not hasattr(root, "__path__"):
+        return []
+
+    base_parts = modname.split(".")
+    need_import: List[str] = []
+
+    for info in pkgutil.walk_packages(root.__path__, root.__name__ + "."):
+        full = info.name
+        rel_parts = full.split(".")[len(base_parts):]
+
+        obj = root
+        missing = False
+        for part in rel_parts:
+            if not hasattr(obj, part):
+                missing = True
+                break
+            obj = getattr(obj, part)
+        if missing:
+            need_import.append(full)
+
+    return sorted(need_import)
 
 
 def build_summary(
@@ -152,7 +188,20 @@ def build_summary(
         "nodes": out_nodes,
     }
 
-def _parse_extra_modules(pyproject_path: Path, extra_name: str) -> List[Tuple[str, str]]:
+def _build_pip_to_modules_map() -> Dict[str, List[str]]:
+    pip_to_mods: Dict[str, List[str]] = {}
+    for mod, dists in importlib_metadata.packages_distributions().items():
+        for dist in dists:
+            key = _normalize_name(dist)
+            pip_to_mods.setdefault(key, []).append(mod)
+    return pip_to_mods
+
+
+def _parse_extra_modules(
+    pyproject_path: Path,
+    extra_name: str,
+    pip_to_modules: Dict[str, List[str]],
+) -> List[Tuple[str, str, str]]:
     with pyproject_path.open("rb") as f:
         data = tomllib.load(f)
 
@@ -164,21 +213,23 @@ def _parse_extra_modules(pyproject_path: Path, extra_name: str) -> List[Tuple[st
         raise KeyError(f"extra {extra_name!r} not found in optional-dependencies")
 
     deps: List[str] = extras[extra_name]
-    modules: List[Tuple[str, str]] = []
+    modules: List[Tuple[str, str, str]] = []
     seen: Set[str] = set()
     for dep in deps:
-        # Extract the base package token and turn it into an importable name.
         m = re.match(r"[A-Za-z0-9_.-]+", dep)
         if not m:
             continue
-        pkg = m.group(0)
-        pkg = pkg.split("[", 1)[0]
-        import_name = pkg.replace("-", "_")
-        symbol_name = sanitize_identifier(import_name.split(".", 1)[0])
-        if symbol_name in seen:
-            continue
-        seen.add(symbol_name)
-        modules.append((import_name, symbol_name))
+        pip_name = m.group(0).split("[", 1)[0]
+        pip_key = _normalize_name(pip_name)
+        mod_candidates = pip_to_modules.get(pip_key)
+        if not mod_candidates:
+            raise KeyError(f"could not resolve import module for pip package {pip_name!r}")
+        for import_name in mod_candidates:
+            symbol_name = sanitize_identifier(import_name.split(".", 1)[0])
+            if symbol_name in seen:
+                continue
+            seen.add(symbol_name)
+            modules.append((pip_name, import_name, symbol_name))
     return modules
 
 
@@ -220,8 +271,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: pyproject file not found: {pyproject_path}", file=sys.stderr)
         return 2
 
+    pip_to_modules = _build_pip_to_modules_map()
+
     try:
-        modules = _parse_extra_modules(pyproject_path, args.extra)
+        modules = _parse_extra_modules(pyproject_path, args.extra, pip_to_modules)
     except KeyError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -229,8 +282,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     imports_dir = Path("imports")
     imports_dir.mkdir(parents=True, exist_ok=True)
 
-    written: List[Tuple[str, str]] = []
-    for import_name, symbol_name in modules:
+    written: List[Tuple[str, str, str]] = []
+    for pip_name, import_name, symbol_name in modules:
         try:
             real_mod = importlib.import_module(import_name)
         except Exception as e:
@@ -238,16 +291,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
         summary = build_summary(real_mod, max_depth=args.max_depth, include_private=args.include_private)
+        explicit_children = _submodules_requiring_import(import_name)
         out_path = imports_dir / f"{symbol_name}.json"
-        payload = {"module": import_name, "summary": summary, "extra": args.extra}
+        if out_path.exists():
+            out_path.unlink()
+        payload = {
+            "pip_name": pip_name,
+            "module": import_name,
+            "summary": summary,
+            "extra": args.extra,
+            "explicit_child_modules": explicit_children,
+        }
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
             f.write("\n")
-        written.append((import_name, symbol_name))
+        written.append((pip_name, import_name, symbol_name))
 
     _write_imports_init(imports_dir)
 
-    print(f"Wrote shims for extra {args.extra!r}: {', '.join(symbol for _, symbol in written)}")
+    print(f"Wrote shims for extra {args.extra!r}: {', '.join(symbol for _, _, symbol in written)}")
     return 0
 
 
