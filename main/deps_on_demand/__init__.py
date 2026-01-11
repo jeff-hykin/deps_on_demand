@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-shimgen2.py
-
-Generates a shim module file <top_level>.py for an optional dependency import,
-but keeps generated code minimal by embedding only a JSON-like summary graph.
-
-Usage:
-  python shimgen2.py cowsay --extras fun
-  # writes ./cowsay.py exporting only `cowsay`
-
-The generated file:
-- tries to import the real module
-- if missing, constructs a generic runtime shim from SUMMARY
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -287,12 +272,49 @@ def generate_shim_file(
     lines.append("        return f\"<MissingOptionalDependency shim {self._modname!r} node={self._sid}>\"")
     lines.append("")
     lines.append("")
-    lines.append(f"try:")
-    lines.append(f"    _real_mod = importlib.import_module({import_name!r})")
-    lines.append(f"    {exported_object_name} = _real_mod")
-    lines.append("except ModuleNotFoundError:")
-    lines.append(f"    _rt = _ShimRuntime({exported_object_name!r}, SUMMARY)")
-    lines.append(f"    {exported_object_name} = _rt.get(SUMMARY[\"root\"])")
+    lines.append("class _LazyModuleProxy:")
+    lines.append("    \"\"\"")
+    lines.append("    Delay importing the real module until first attribute access.")
+    lines.append("    Falls back to the shim runtime if the module is missing.")
+    lines.append("    \"\"\"")
+    lines.append("")
+    lines.append("    __slots__ = (\"_modname\", \"_summary\", \"_loaded\", \"_obj\")")
+    lines.append("")
+    lines.append("    def __init__(self, modname: str, summary: Dict[str, Any]) -> None:")
+    lines.append("        self._modname = modname")
+    lines.append("        self._summary = summary")
+    lines.append("        self._loaded = False")
+    lines.append("        self._obj: Optional[Any] = None")
+    lines.append("")
+    lines.append("    def _load(self) -> Any:")
+    lines.append("        if self._loaded:")
+    lines.append("            return self._obj")
+    lines.append("        try:")
+    lines.append("            mod = importlib.import_module(self._modname)")
+    lines.append("        except ModuleNotFoundError:")
+    lines.append("            rt = _ShimRuntime(self._modname, self._summary)")
+    lines.append("            mod = rt.get(self._summary[\"root\"])")
+    lines.append("        self._obj = mod")
+    lines.append("        self._loaded = True")
+    lines.append("        return mod")
+    lines.append("")
+    lines.append("    def __getattr__(self, name: str) -> Any:")
+    lines.append("        obj = self._load()")
+    lines.append("        return getattr(obj, name)")
+    lines.append("")
+    lines.append("    def __dir__(self) -> list[str]:")
+    lines.append("        if self._loaded and self._obj is not None:")
+    lines.append("            return sorted(set(dir(self._obj)))")
+    lines.append("        node = self._summary[\"nodes\"][str(self._summary[\"root\"])]")
+    lines.append("        return sorted(set(node.get(\"children\", {}).keys()) | set(node.get(\"eager\", [])))")
+    lines.append("")
+    lines.append("    def __repr__(self) -> str:")
+    lines.append("        if not self._loaded:")
+    lines.append("            return f\"<LazyModuleProxy for {self._modname!r}>\"")
+    lines.append("        return repr(self._obj)")
+    lines.append("")
+    lines.append("")
+    lines.append(f"{exported_object_name} = _LazyModuleProxy({import_name!r}, SUMMARY)")
     lines.append("")
 
     return "\n".join(lines)
