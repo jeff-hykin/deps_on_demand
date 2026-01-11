@@ -113,17 +113,19 @@ def _submodules_requiring_import(modname: str) -> List[str]:
 def build_summary(
     root_obj: Any,
     *,
-    max_depth: int,
     include_private: bool,
 ) -> Dict[str, Any]:
     """
-    Build a cyclic-safe summary graph.
+    Build a cyclic-safe summary graph without recursive traversal (avoids stack overflow).
 
     Back-edges are represented by reusing node IDs (object identity).
     """
     objid_to_nodeid: Dict[int, int] = {}
     nodes: Dict[int, SumNode] = {}
+    expanded: Set[int] = set()
+    nid_to_obj: Dict[int, Any] = {}
     next_id = 0
+    to_expand: List[Tuple[Any, int]] = []
 
     def get_node_id(obj: Any, kind: str) -> int:
         nonlocal next_id
@@ -136,19 +138,22 @@ def build_summary(
         nodes[nid] = SumNode(kind=kind)
         return nid
 
-    def walk(obj: Any, depth: int) -> int:
+    def schedule(obj: Any) -> int:
         kind = classify_value(obj)
         if kind == "eager":
-            raise AssertionError("walk() should not be called for eager values")
-
+            raise AssertionError("schedule() should not be called for eager values")
         nid = get_node_id(obj, kind)
+        if nid not in expanded and nid not in nid_to_obj:
+            nid_to_obj[nid] = obj
+            to_expand.append((obj, nid))
+        return nid
 
-        # If already expanded, avoid re-walking to prevent cycles
-        # (still OK: children may already be partially filled)
-        if depth >= max_depth:
-            return nid
+    root_id = schedule(root_obj)
 
-        # Expand
+    while to_expand:
+        obj, nid = to_expand.pop()
+        if nid in expanded:
+            continue
         node = nodes[nid]
         for name, val in safe_iter_members(obj):
             if not isinstance(name, str):
@@ -166,13 +171,10 @@ def build_summary(
                 node.eager.add(name)
                 continue
 
-            # recurse
-            child_id = walk(val, depth + 1)
+            child_id = schedule(val)
             node.children[name] = child_id
 
-        return nid
-
-    root_id = walk(root_obj, 0)
+        expanded.add(nid)
 
     # Convert nodes to JSON-serializable form
     out_nodes: Dict[str, Any] = {}
@@ -262,7 +264,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="shimgen2", description="Generate optional-dependency shim JSON bundle for an extra")
     ap.add_argument("extra", help="Extra name from [project.optional-dependencies]")
     ap.add_argument("pyproject", nargs="?", default="pyproject.toml", help="Path to pyproject.toml (default: pyproject.toml)")
-    ap.add_argument("--max-depth", type=int, default=4, help="Max recursion depth (default: 4)")
     ap.add_argument("--include-private", action="store_true", help="Include private members (names starting with _)")
 
     args = ap.parse_args(argv)
@@ -290,8 +291,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"error: could not import {import_name!r} for introspection: {e!r}", file=sys.stderr)
             return 2
 
-        summary = build_summary(real_mod, max_depth=args.max_depth, include_private=args.include_private)
         explicit_children = _submodules_requiring_import(import_name)
+        for child in explicit_children:
+            # Skip private/internal submodules.
+            if any(part.startswith("_") for part in child.split(".")):
+                continue
+            try:
+                importlib.import_module(child)
+            except Exception as e:
+                print(f"warning: skipped submodule {child!r} due to import error: {e!r}", file=sys.stderr)
+
+        summary = build_summary(real_mod, include_private=args.include_private)
         out_path = imports_dir / f"{symbol_name}.json"
         if out_path.exists():
             out_path.unlink()
