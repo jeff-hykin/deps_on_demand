@@ -10,6 +10,7 @@ import keyword
 import pkgutil
 import re
 import sys
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -261,6 +262,10 @@ def _write_imports_init(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Silence noisy deprecations during introspection/import.
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
     ap = argparse.ArgumentParser(prog="shimgen2", description="Generate optional-dependency shim JSON bundle for an extra")
     ap.add_argument("extra", help="Extra name from [project.optional-dependencies]")
     ap.add_argument("pyproject", nargs="?", default="pyproject.toml", help="Path to pyproject.toml (default: pyproject.toml)")
@@ -298,7 +303,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
             try:
                 importlib.import_module(child)
-            except Exception as e:
+            except BaseException as e:
                 print(f"warning: skipped submodule {child!r} due to import error: {e!r}", file=sys.stderr)
 
         summary = build_summary(real_mod, include_private=args.include_private)
