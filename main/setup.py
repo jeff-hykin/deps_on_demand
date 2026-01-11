@@ -1,11 +1,13 @@
 import setuptools
-import toml
+import tomllib as toml
+# import toml
 # from file_system_py import iterate_paths_in
 
 # 
 # get the data out of the toml file
 # 
-toml_info = toml.load("../pyproject.toml")
+with open("../pyproject.toml", 'r') as in_file:
+    toml_info = toml.loads(in_file.read())
 package_info = {**toml_info["tool"]["poetry"], **toml_info["tool"]["extra"]}
 
 # 

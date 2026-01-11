@@ -5,14 +5,15 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# This string is overwritten by generated imports/__init__.py to point at the
-# relevant extras group. Default keeps a readable hint if used directly.
-INSTALL_MESSAGE = None
+__all__ = ['torch']
+
+INSTALL_MESSAGE = 'pip install .[misc]'
 
 def _missing_dep_error(modname: str) -> ModuleNotFoundError:
-    msg = f"Optional dependency {modname!r} is required for this feature. "
-    if INSTALL_MESSAGE:
-        msg += f"\n\n{INSTALL_MESSAGE}"
+    msg = (
+        f"Optional dependency {modname!r} is required for this feature. "
+        f"Install it with: {INSTALL_MESSAGE}"
+    )
     return ModuleNotFoundError(msg)
 
 
@@ -86,58 +87,22 @@ class _ShimNamespace:
 
 
 class LazyModuleProxy:
-    """
-    Lazily import the real module on first attribute access, or fall back to a
-    shim built from a stored JSON summary. Accepts either:
-      - (modname, summary_dict) for direct construction, or
-      - (stem_name, base_path) where base_path/stem_name.json holds {"module", "summary"}.
-    """
+    __slots__ = ("_modname", "_summary", "_loaded", "_obj")
 
-    __slots__ = ("_stem", "_base", "_modname", "_summary", "_loaded", "_obj")
-
-    def __init__(self, mod_identifier: str, summary_or_base: Any) -> None:
-        self._stem = mod_identifier
-        self._base: Optional[Path] = None
-        self._modname: Optional[str] = None
-        self._summary: Optional[Dict[str, Any]] = None
+    def __init__(self, modname: str, summary: Dict[str, Any]) -> None:
+        self._modname = modname
+        self._summary = summary
         self._loaded = False
         self._obj: Optional[Any] = None
-
-        if isinstance(summary_or_base, dict):
-            self._modname = mod_identifier
-            self._summary = summary_or_base
-        else:
-            self._base = Path(summary_or_base)
-
-    def _ensure_summary(self) -> None:
-        if self._summary is not None and self._modname is not None:
-            return
-        if self._base is None:
-            raise RuntimeError("LazyModuleProxy missing summary and base path")
-        path = self._base / f"{self._stem}.json"
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"shim summary file not found: {path}") from e
-        self._modname = data.get("module", self._stem)
-        self._summary = data.get("summary")
-        if self._summary is None:
-            raise RuntimeError(f"shim summary missing for {self._stem!r} in {path}")
 
     def _load(self) -> Any:
         if self._loaded:
             return self._obj
-
-        self._ensure_summary()
-        assert self._modname is not None
-        assert self._summary is not None
-
         try:
             mod = importlib.import_module(self._modname)
         except ModuleNotFoundError:
             rt = _ShimRuntime(self._modname, self._summary)
-            mod = rt.get(self._summary["root"])
+            mod = rt.get(self._summary["root"] )
         self._obj = mod
         self._loaded = True
         return mod
@@ -149,12 +114,11 @@ class LazyModuleProxy:
     def __dir__(self) -> list[str]:
         if self._loaded and self._obj is not None:
             return sorted(set(dir(self._obj)))
-        self._ensure_summary()
-        assert self._summary is not None
         node = self._summary["nodes"][str(self._summary["root"])]
         return sorted(set(node.get("children", {}).keys()) | set(node.get("eager", [])))
 
     def __repr__(self) -> str:
         if not self._loaded:
-            return f"<LazyModuleProxy for {self._stem!r}>"
+            return f"<LazyModuleProxy for {self._modname!r}>"
         return repr(self._obj)
+
