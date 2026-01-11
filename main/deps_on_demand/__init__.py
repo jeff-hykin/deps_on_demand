@@ -5,27 +5,31 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# This string is overwritten by generated imports/__init__.py to point at the
-# relevant extras group. Default keeps a readable hint if used directly.
-INSTALL_MESSAGE = None
+DEFAULT_INSTALL_MESSAGE = None  # default; per-module install hints come from JSON
 
-def _missing_dep_error(modname: str) -> ModuleNotFoundError:
-    msg = f"Optional dependency {modname!r} is required for this feature. "
-    if INSTALL_MESSAGE:
-        msg += f"\n\n{INSTALL_MESSAGE}"
+
+def _missing_dep_error(modname: str, install_message: Optional[str] = None) -> ModuleNotFoundError:
+    msg = f"Optional dependency {modname!r} is required for this feature."
+    hint = install_message or DEFAULT_INSTALL_MESSAGE
+    if hint:
+        msg += f"\n\n{hint}"
     return ModuleNotFoundError(msg)
 
 
 class _MissingTypeMeta(type):
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
-        raise _missing_dep_error(getattr(cls, "__shim_modname__", cls.__name__))
+        raise _missing_dep_error(
+            getattr(cls, "__shim_modname__", cls.__name__),
+            getattr(cls, "__shim_install_message__", None),
+        )
 
 
 class _ShimRuntime:
-    def __init__(self, modname: str, summary: Dict[str, Any]) -> None:
+    def __init__(self, modname: str, summary: Dict[str, Any], install_message: Optional[str]) -> None:
         self._modname = modname
         self._nodes: Dict[str, Any] = summary["nodes"]
         self._memo: Dict[str, Any] = {}
+        self._install_message = install_message
 
     def get(self, node_id: int) -> Any:
         sid = str(node_id)
@@ -37,13 +41,14 @@ class _ShimRuntime:
 
         if kind == "fn":
             def _missing_fn(*args: Any, **kwargs: Any) -> Any:
-                raise _missing_dep_error(self._modname)
+                raise _missing_dep_error(self._modname, self._install_message)
             self._memo[sid] = _missing_fn
             return _missing_fn
 
         if kind == "type":
             T = _MissingTypeMeta(f"Missing_{self._modname}_{sid}", (), {})
             setattr(T, "__shim_modname__", self._modname)
+            setattr(T, "__shim_install_message__", self._install_message)
             self._memo[sid] = T
             ns = _ShimNamespace(self, self._modname, sid)
             setattr(T, "_shim_ns", ns)
@@ -71,7 +76,7 @@ class _ShimNamespace:
     def __getattr__(self, name: str) -> Any:
         node = self._rt._nodes[self._sid]
         if name in node.get("eager", []):
-            raise _missing_dep_error(self._modname)
+            raise _missing_dep_error(self._modname, self._rt._install_message)
         children = node.get("children", {})
         if name in children:
             return self._rt.get(children[name])
@@ -93,13 +98,14 @@ class LazyModuleProxy:
       - (stem_name, base_path) where base_path/stem_name.json holds {"module", "summary"}.
     """
 
-    __slots__ = ("_stem", "_base", "_modname", "_summary", "_loaded", "_obj")
+    __slots__ = ("_stem", "_base", "_modname", "_summary", "_install_message", "_loaded", "_obj")
 
     def __init__(self, mod_identifier: str, summary_or_base: Any) -> None:
         self._stem = mod_identifier
         self._base: Optional[Path] = None
         self._modname: Optional[str] = None
         self._summary: Optional[Dict[str, Any]] = None
+        self._install_message: Optional[str] = None
         self._loaded = False
         self._obj: Optional[Any] = None
 
@@ -122,6 +128,9 @@ class LazyModuleProxy:
             raise FileNotFoundError(f"shim summary file not found: {path}") from e
         self._modname = data.get("module", self._stem)
         self._summary = data.get("summary")
+        extra = data.get("extra")
+        if extra:
+            self._install_message = f"pip install .[{extra}]"
         if self._summary is None:
             raise RuntimeError(f"shim summary missing for {self._stem!r} in {path}")
 
@@ -136,7 +145,7 @@ class LazyModuleProxy:
         try:
             mod = importlib.import_module(self._modname)
         except ModuleNotFoundError:
-            rt = _ShimRuntime(self._modname, self._summary)
+            rt = _ShimRuntime(self._modname, self._summary, self._install_message)
             mod = rt.get(self._summary["root"])
         self._obj = mod
         self._loaded = True
