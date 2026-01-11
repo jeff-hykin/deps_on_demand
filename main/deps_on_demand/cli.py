@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import importlib.metadata as importlib_metadata
 import inspect
 import json
 import keyword
@@ -11,6 +10,10 @@ import pkgutil
 import re
 import sys
 import warnings
+from contextlib import redirect_stdout, redirect_stderr, contextmanager
+from io import StringIO
+
+import importlib.metadata as importlib_metadata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -87,28 +90,46 @@ def _submodules_requiring_import(modname: str) -> List[str]:
     List submodules under `modname` that are not already accessible as attributes
     after importing `modname` itself.
     """
-    root = importlib.import_module(modname)
+    root = _quiet_import(modname)
     if not hasattr(root, "__path__"):
         return []
 
     base_parts = modname.split(".")
     need_import: List[str] = []
 
-    for info in pkgutil.walk_packages(root.__path__, root.__name__ + "."):
-        full = info.name
-        rel_parts = full.split(".")[len(base_parts):]
+    with _silence_imports():
+        for info in pkgutil.walk_packages(root.__path__, root.__name__ + "."):
+            full = info.name
+            rel_parts = full.split(".")[len(base_parts):]
 
-        obj = root
-        missing = False
-        for part in rel_parts:
-            if not hasattr(obj, part):
-                missing = True
-                break
-            obj = getattr(obj, part)
-        if missing:
-            need_import.append(full)
+            obj = root
+            missing = False
+            for part in rel_parts:
+                if not hasattr(obj, part):
+                    missing = True
+                    break
+                obj = getattr(obj, part)
+            if missing:
+                need_import.append(full)
 
     return sorted(need_import)
+
+
+def _quiet_import(modname: str) -> Any:
+    buf = StringIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with redirect_stdout(buf), redirect_stderr(buf):
+            return importlib.import_module(modname)
+
+
+@contextmanager
+def _silence_imports() -> Any:
+    buf = StringIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with redirect_stdout(buf), redirect_stderr(buf):
+            yield
 
 
 def build_summary(
@@ -265,6 +286,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Silence noisy deprecations during introspection/import.
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
 
     ap = argparse.ArgumentParser(prog="shimgen2", description="Generate optional-dependency shim JSON bundle for an extra")
     ap.add_argument("extra", help="Extra name from [project.optional-dependencies]")
@@ -291,7 +313,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     written: List[Tuple[str, str, str]] = []
     for pip_name, import_name, symbol_name in modules:
         try:
-            real_mod = importlib.import_module(import_name)
+            real_mod = _quiet_import(import_name)
         except Exception as e:
             print(f"error: could not import {import_name!r} for introspection: {e!r}", file=sys.stderr)
             return 2
@@ -299,14 +321,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         explicit_children = _submodules_requiring_import(import_name)
         for child in explicit_children:
             # Skip private/internal submodules.
-            if any(part.startswith("_") for part in child.split(".")):
+            parts = child.split(".")
+            if any(part.startswith("_") for part in parts):
+                continue
+            if "tests" in parts or "testing" in parts:
                 continue
             try:
-                importlib.import_module(child)
+                _quiet_import(child)
             except BaseException as e:
                 print(f"warning: skipped submodule {child!r} due to import error: {e!r}", file=sys.stderr)
 
-        summary = build_summary(real_mod, include_private=args.include_private)
+        with _silence_imports():
+            summary = build_summary(real_mod, include_private=args.include_private)
         out_path = imports_dir / f"{symbol_name}.json"
         if out_path.exists():
             out_path.unlink()
