@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 DEFAULT_INSTALL_MESSAGE = None  # default; per-module install hints come from JSON
 
@@ -98,7 +98,16 @@ class LazyModuleProxy:
       - (stem_name, base_path) where base_path/stem_name.json holds {"module", "summary"}.
     """
 
-    __slots__ = ("_stem", "_base", "_modname", "_summary", "_install_message", "_loaded", "_obj")
+    __slots__ = (
+        "_stem",
+        "_base",
+        "_modname",
+        "_summary",
+        "_install_message",
+        "_explicit_children",
+        "_loaded",
+        "_obj",
+    )
 
     def __init__(self, mod_identifier: str, summary_or_base: Any) -> None:
         self._stem = mod_identifier
@@ -106,6 +115,7 @@ class LazyModuleProxy:
         self._modname: Optional[str] = None
         self._summary: Optional[Dict[str, Any]] = None
         self._install_message: Optional[str] = None
+        self._explicit_children: Set[str] = set()
         self._loaded = False
         self._obj: Optional[Any] = None
 
@@ -131,6 +141,7 @@ class LazyModuleProxy:
         extra = data.get("extra")
         if extra:
             self._install_message = f"pip install .[{extra}]"
+        self._explicit_children = set(data.get("explicit_child_modules", []))
         if self._summary is None:
             raise RuntimeError(f"shim summary missing for {self._stem!r} in {path}")
 
@@ -147,12 +158,34 @@ class LazyModuleProxy:
         except ModuleNotFoundError:
             rt = _ShimRuntime(self._modname, self._summary, self._install_message)
             mod = rt.get(self._summary["root"])
+        else:
+            # Best-effort import of explicit child modules so their attributes are present.
+            for child in self._explicit_children:
+                try:
+                    importlib.import_module(child)
+                except BaseException:
+                    # Swallow errors; child may rely on optional deps.
+                    pass
         self._obj = mod
         self._loaded = True
         return mod
 
     def __getattr__(self, name: str) -> Any:
         obj = self._load()
+        try:
+            return getattr(obj, name)
+        except AttributeError:
+            # If the requested attribute belongs to an explicit child module, make sure
+            # that child is imported before retrying (handles packages that don't
+            # auto-load their submodules).
+            for child in self._explicit_children:
+                tail = child.rsplit(".", 1)[-1]
+                if child.startswith(f"{self._modname}.") and tail == name:
+                    try:
+                        importlib.import_module(child)
+                    except BaseException:
+                        pass
+                    break
         return getattr(obj, name)
 
     def __dir__(self) -> list[str]:
