@@ -105,6 +105,7 @@ class LazyModuleProxy:
         "_summary",
         "_install_message",
         "_explicit_children",
+        "_explicit_trie",
         "_loaded",
         "_obj",
     )
@@ -116,6 +117,7 @@ class LazyModuleProxy:
         self._summary: Optional[Dict[str, Any]] = None
         self._install_message: Optional[str] = None
         self._explicit_children: Set[str] = set()
+        self._explicit_trie: Dict[str, Any] = {}
         self._loaded = False
         self._obj: Optional[Any] = None
 
@@ -142,10 +144,35 @@ class LazyModuleProxy:
         if extra:
             self._install_message = f"pip install .[{extra}]"
         self._explicit_children = set(data.get("explicit_child_modules", []))
+        self._explicit_trie = self._build_trie(self._explicit_children)
         if self._summary is None:
             raise RuntimeError(f"shim summary missing for {self._stem!r} in {path}")
 
-    def _load(self) -> Any:
+    def _build_trie(self, paths: Set[str]) -> Dict[str, Any]:
+        trie: Dict[str, Any] = {}
+        if not self._modname:
+            return trie
+        prefix = f"{self._modname}."
+        for p in paths:
+            if not p.startswith(prefix):
+                continue
+            segs = p[len(prefix) :].split(".")
+            node = trie
+            for i, seg in enumerate(segs):
+                node = node.setdefault(seg, {"module": None, "children": {}})
+                if i == len(segs) - 1:
+                    node["module"] = p
+                else:
+                    node = node["children"]
+        return trie
+
+    def _resolve_loaded_attr(self, segments: list[str]) -> Any:
+        obj = self._load()
+        for seg in segments:
+            obj = getattr(obj, seg)
+        return obj
+
+    def _load(self, module_to_import: Optional[str] = None) -> Any:
         if self._loaded:
             return self._obj
 
@@ -153,24 +180,26 @@ class LazyModuleProxy:
         assert self._modname is not None
         assert self._summary is not None
 
+        target = module_to_import or self._modname
         try:
+            importlib.import_module(target)
+            # Ensure root module object is returned.
             mod = importlib.import_module(self._modname)
         except ModuleNotFoundError:
             rt = _ShimRuntime(self._modname, self._summary, self._install_message)
             mod = rt.get(self._summary["root"])
-        else:
-            # Best-effort import of explicit child modules so their attributes are present.
-            for child in self._explicit_children:
-                try:
-                    importlib.import_module(child)
-                except BaseException:
-                    # Swallow errors; child may rely on optional deps.
-                    pass
         self._obj = mod
         self._loaded = True
         return mod
 
     def __getattr__(self, name: str) -> Any:
+        if not self._loaded:
+            self._ensure_summary()
+        # If the attribute is an explicit child subtree, return an intermediate proxy
+        # that will import the child module when deeper attributes are accessed.
+        if not self._loaded and name in self._explicit_trie:
+            return _IntermediateNamespace(self, self._explicit_trie[name], [name])
+
         obj = self._load()
         try:
             return getattr(obj, name)
@@ -194,9 +223,56 @@ class LazyModuleProxy:
         self._ensure_summary()
         assert self._summary is not None
         node = self._summary["nodes"][str(self._summary["root"])]
-        return sorted(set(node.get("children", {}).keys()) | set(node.get("eager", [])))
+        names = set(node.get("children", {}).keys()) | set(node.get("eager", []))
+        names |= set(self._explicit_trie.keys())
+        return sorted(names)
 
     def __repr__(self) -> str:
         if not self._loaded:
             return f"<LazyModuleProxy for {self._stem!r}>"
         return repr(self._obj)
+
+
+class _IntermediateNamespace:
+    __slots__ = ("_proxy", "_node", "_segments")
+
+    def __init__(self, proxy: LazyModuleProxy, trie_node: Dict[str, Any], segments: list[str]) -> None:
+        self._proxy = proxy
+        self._node = trie_node
+        self._segments = segments
+
+    def __getattr__(self, name: str) -> Any:
+        # If root already loaded, resolve directly.
+        if self._proxy._loaded:
+            return self._proxy._resolve_loaded_attr(self._segments + [name])
+
+        children = self._node.get("children", {})
+        if name in children:
+            child_node = children[name]
+            if child_node.get("module"):
+                # Leaf: import the child module, then resolve attribute chain.
+                self._proxy._load(module_to_import=child_node["module"])
+                return self._proxy._resolve_loaded_attr(self._segments + [name])
+            return _IntermediateNamespace(self._proxy, child_node, self._segments + [name])
+
+        # If this node itself represents a module, try importing it before resolving.
+        module_path = self._node.get("module")
+        if module_path:
+            self._proxy._load(module_to_import=module_path)
+            return self._proxy._resolve_loaded_attr(self._segments + [name])
+
+        # Fallback: load root and resolve.
+        return self._proxy._resolve_loaded_attr(self._segments + [name])
+
+    def __dir__(self) -> list[str]:
+        names = set(self._node.get("children", {}).keys())
+        if self._node.get("module"):
+            try:
+                obj = self._proxy._resolve_loaded_attr(self._segments)
+                names |= set(dir(obj))
+            except Exception:
+                pass
+        return sorted(names)
+
+    def __repr__(self) -> str:
+        return f"<IntermediateNamespace {'.'.join(self._segments)}>"
